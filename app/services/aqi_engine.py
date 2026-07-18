@@ -1,15 +1,11 @@
 """
-app/services/aqi_engine.py
---------------------------
-Pure-Python AQI computation engine.
+AQI Engine — CPCB National Air Quality Index Calculator.
 
-Standard  : CPCB CUPS/82/2014-15
-Dependency: stdlib only (dataclasses, typing) — zero third-party imports.
+Implements the CPCB (Central Pollution Control Board) AQI calculation
+methodology as per CUPS/82/2014-15. Uses linear interpolation sub-index
+formula with max() aggregation across pollutants.
 
-Public API
-~~~~~~~~~~
-  calculate_sub_index(pollutant, concentration) -> float | None
-  compute_aqi(readings, include_lead)           -> AQIResult
+This module is pure Python with zero external dependencies.
 """
 
 from __future__ import annotations
@@ -17,219 +13,204 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+
 # ---------------------------------------------------------------------------
-# Breakpoint table
+# CPCB Breakpoints (CUPS/82/2014-15)
+# Each tuple: (C_LO, C_HI, I_LO, I_HI)
+# Units: PM10/PM2.5/NO2/SO2/O3/NH3 in µg/m³; CO in mg/m³; Pb in µg/m³
 # ---------------------------------------------------------------------------
-# Each row: (BLO, BHI, ILO, IHI)
-#   BLO/BHI  — pollutant concentration low/high for this segment
-#   ILO/IHI  — corresponding AQI sub-index low/high
-#
-# Units
-#   pm10, pm25, no2, so2, o3, nh3, pb  →  µg/m³
-#   co                                  →  mg/m³  (NOT µg/m³)
-# ---------------------------------------------------------------------------
+
 BREAKPOINTS: dict[str, list[tuple[float, float, int, int]]] = {
     "pm10": [
-        (0,    50,   0,   50),
-        (51,   100,  51,  100),
-        (101,  250,  101, 200),
-        (251,  350,  201, 300),
-        (351,  430,  301, 400),
-        (431,  9999, 401, 500),
+        (0, 50, 0, 50),
+        (51, 100, 51, 100),
+        (101, 250, 101, 200),
+        (251, 350, 201, 300),
+        (351, 430, 301, 400),
+        (431, 9999, 401, 500),
     ],
     "pm25": [
-        (0,    30,   0,   50),
-        (31,   60,   51,  100),
-        (61,   90,   101, 200),
-        (91,   120,  201, 300),
-        (121,  250,  301, 400),
-        (251,  9999, 401, 500),
+        (0, 30, 0, 50),
+        (31, 60, 51, 100),
+        (61, 90, 101, 200),
+        (91, 120, 201, 300),
+        (121, 250, 301, 400),
+        (251, 9999, 401, 500),
     ],
     "no2": [
-        (0,   40,   0,   50),
-        (41,  80,   51,  100),
-        (81,  180,  101, 200),
-        (181, 280,  201, 300),
-        (281, 400,  301, 400),
+        (0, 40, 0, 50),
+        (41, 80, 51, 100),
+        (81, 180, 101, 200),
+        (181, 280, 201, 300),
+        (281, 400, 301, 400),
         (401, 9999, 401, 500),
     ],
     "so2": [
-        (0,    40,   0,   50),
-        (41,   80,   51,  100),
-        (81,   380,  101, 200),
-        (381,  800,  201, 300),
-        (801,  1600, 301, 400),
+        (0, 40, 0, 50),
+        (41, 80, 51, 100),
+        (81, 380, 101, 200),
+        (381, 800, 201, 300),
+        (801, 1600, 301, 400),
         (1601, 9999, 401, 500),
     ],
     "o3": [
-        (0,   50,   0,   50),
-        (51,  100,  51,  100),
-        (101, 168,  101, 200),
-        (169, 208,  201, 300),
-        (209, 748,  301, 400),
+        (0, 50, 0, 50),
+        (51, 100, 51, 100),
+        (101, 168, 101, 200),
+        (169, 208, 201, 300),
+        (209, 748, 301, 400),
         (749, 9999, 401, 500),
     ],
     "co": [
-        # CO in mg/m³  — do NOT convert to µg/m³ before passing here
-        (0,    1.0,  0,   50),
-        (1.1,  2.0,  51,  100),
-        (2.1,  10,   101, 200),
-        (10.1, 17,   201, 300),
-        (17.1, 34,   301, 400),
+        (0, 1.0, 0, 50),
+        (1.1, 2.0, 51, 100),
+        (2.1, 10, 101, 200),
+        (10.1, 17, 201, 300),
+        (17.1, 34, 301, 400),
         (34.1, 9999, 401, 500),
     ],
     "nh3": [
-        (0,    200,  0,   50),
-        (201,  400,  51,  100),
-        (401,  800,  101, 200),
-        (801,  1200, 201, 300),
+        (0, 200, 0, 50),
+        (201, 400, 51, 100),
+        (401, 800, 101, 200),
+        (801, 1200, 201, 300),
         (1201, 1800, 301, 400),
         (1801, 9999, 401, 500),
     ],
     "pb": [
-        # Lead — for historical queries only (never included in live AQI by default)
-        (0,   0.5,  0,   50),
-        (0.6, 1.0,  51,  100),
-        (1.1, 2.0,  101, 200),
-        (2.1, 3.0,  201, 300),
-        (3.1, 3.5,  301, 400),
+        (0, 0.5, 0, 50),
+        (0.6, 1.0, 51, 100),
+        (1.1, 2.0, 101, 200),
+        (2.1, 3.0, 201, 300),
+        (3.1, 3.5, 301, 400),
         (3.6, 9999, 401, 500),
     ],
 }
 
+
 # ---------------------------------------------------------------------------
-# AQI category lookup
+# AQI Category Bands
 # ---------------------------------------------------------------------------
-# Each row: (ILO, IHI, category_label, health_statement)
+
 AQI_CATEGORIES: list[tuple[int, int, str, str]] = [
-    (0,   50,  "Good",         "Minimal Impact"),
-    (51,  100, "Satisfactory", "May cause minor breathing discomfort to sensitive people"),
-    (101, 200, "Moderate",     "May cause breathing discomfort to people with lung/heart disease"),
-    (201, 300, "Poor",         "May cause breathing discomfort on prolonged exposure"),
-    (301, 400, "Very Poor",    "Respiratory illness on prolonged exposure; pronounced in lung/heart patients"),
-    (401, 500, "Severe",       "Respiratory effects even on healthy people; serious impacts on sensitive groups"),
+    (0, 50, "Good", "Minimal Impact"),
+    (
+        51,
+        100,
+        "Satisfactory",
+        "May cause minor breathing discomfort to sensitive people",
+    ),
+    (
+        101,
+        200,
+        "Moderate",
+        "May cause breathing discomfort to people with lung/heart disease",
+    ),
+    (201, 300, "Poor", "May cause breathing discomfort on prolonged exposure"),
+    (
+        301,
+        400,
+        "Very Poor",
+        "Respiratory illness on prolonged exposure; pronounced in lung/heart patients",
+    ),
+    (
+        401,
+        500,
+        "Severe",
+        "Respiratory effects even on healthy people; serious impacts on sensitive groups",
+    ),
 ]
 
 
 # ---------------------------------------------------------------------------
-# Result dataclass
+# AQI Result dataclass
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class AQIResult:
-    """Fully described AQI computation outcome."""
+    """Result of an AQI computation for a set of pollutant readings.
 
-    aqi: Optional[float]
-    """Computed AQI value (max of all valid sub-indices), or None when invalid."""
-
-    category: Optional[str]
-    """Human-readable category label (Good / Satisfactory / … / Severe)."""
-
-    responsible_pollutant: Optional[str]
-    """Key of the pollutant that drove the final AQI (highest sub-index)."""
-
-    sub_indices: dict[str, float] = field(default_factory=dict)
-    """All computed sub-indices keyed by pollutant name."""
-
-    health_statement: Optional[str] = None
-    """Guidance text associated with the AQI category."""
-
-    is_valid: bool = False
-    """True only when enough data was present to compute a meaningful AQI."""
-
-    reason: Optional[str] = None
-    """Why the result is invalid (populated when is_valid=False)."""
-
-
-# ---------------------------------------------------------------------------
-# Core formula helpers
-# ---------------------------------------------------------------------------
-
-def _find_segment(
-    pollutant: str,
-    concentration: float,
-) -> Optional[tuple[float, float, int, int]]:
-    """Return the breakpoint row whose [BLO, BHI] bracket covers *concentration*.
-
-    Returns None if the concentration falls below all defined segments
-    (negative values are rejected upstream).  If it exceeds all segments the
-    caller handles the overflow case.
+    Attributes:
+        aqi: The computed Air Quality Index value (0–500+), or None if invalid.
+        category: CPCB category label (Good / Satisfactory / … / Severe).
+        responsible_pollutant: The pollutant with the highest sub-index.
+        sub_indices: Mapping of pollutant name → computed sub-index value.
+        health_statement: CPCB health advisory for the computed category.
+        is_valid: Whether the computation met minimum data requirements.
+        reason: Human-readable reason when ``is_valid`` is False.
     """
-    for segment in BREAKPOINTS[pollutant]:
-        blo, bhi, _ilo, _ihi = segment
-        if blo <= concentration <= bhi:
-            return segment
-    return None
+
+    aqi: Optional[float] = None
+    category: Optional[str] = None
+    responsible_pollutant: Optional[str] = None
+    sub_indices: dict[str, float] = field(default_factory=dict)
+    health_statement: Optional[str] = None
+    is_valid: bool = True
+    reason: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def calculate_sub_index(pollutant: str, concentration: float) -> Optional[float]:
-    """Compute the CPCB sub-index for *pollutant* at *concentration*.
+    """Calculate the sub-index for a single pollutant using CPCB linear interpolation.
 
-    Parameters
-    ----------
-    pollutant     : One of the keys in BREAKPOINTS (case-sensitive).
-    concentration : Measured value in the units expected by BREAKPOINTS.
-                    CO must be in mg/m³; all others in µg/m³.
+    Formula (CPCB Chapter 3.5)::
 
-    Returns
-    -------
-    float         : Rounded sub-index (2 decimal places).
-    None          : When concentration is negative (sensor error / missing).
+        Ip = ((IHI - ILO) / (BHI - BLO)) * (Cp - BLO) + ILO
 
-    Raises
-    ------
-    ValueError    : Unknown pollutant key.
+    When ILO > 50, ILO is decremented by 1 before applying the formula as per
+    the CPCB specification.
 
-    Notes
-    -----
-    CPCB Chapter 3.5 ILO-decrement rule:
-      When the looked-up ILO > 50, subtract 1 before applying the linear
-      interpolation formula.  This ensures the sub-index boundary at the
-      first point of each band above Good equals the lower bound exactly.
+    Args:
+        pollutant: Pollutant key (e.g. ``'pm25'``, ``'co'``). Must exist in
+            :data:`BREAKPOINTS`.
+        concentration: Measured concentration value. Units must match the
+            breakpoint table (µg/m³ for most; **mg/m³ for CO**).
 
-    Formula:
-      Ip = ((IHI - ILO) / (BHI - BLO)) * (Cp - BLO) + ILO
+    Returns:
+        The computed sub-index as a float, or ``None`` if concentration is
+        negative. Returns ``500.0`` if the concentration exceeds the highest
+        breakpoint segment.
+
+    Raises:
+        KeyError: If *pollutant* is not present in :data:`BREAKPOINTS`.
     """
-    if pollutant not in BREAKPOINTS:
-        raise ValueError(
-            f"Unknown pollutant '{pollutant}'. "
-            f"Valid keys: {sorted(BREAKPOINTS.keys())}"
-        )
-
-    # Negative concentrations are physically impossible; treat as missing data.
     if concentration < 0:
         return None
 
-    segment = _find_segment(pollutant, concentration)
+    segments = BREAKPOINTS[pollutant]
 
-    # Concentration exceeds every defined segment — clamp at 500.
-    if segment is None:
-        return 500.0
+    for c_lo, c_hi, i_lo, i_hi in segments:
+        if c_lo <= concentration <= c_hi:
+            # CPCB Chapter 3.5: decrement ILO by 1 when ILO > 50
+            adjusted_i_lo = i_lo - 1 if i_lo > 50 else i_lo
+            sub_index = ((i_hi - adjusted_i_lo) / (c_hi - c_lo)) * (
+                concentration - c_lo
+            ) + adjusted_i_lo
+            return round(sub_index, 2)
 
-    blo, bhi, ilo, ihi = segment
-
-    # CPCB Ch 3.5 ILO-decrement: bands above Good use ILO - 1 in the formula.
-    effective_ilo: float = float(ilo - 1) if ilo > 50 else float(ilo)
-
-    # Guard against zero-width segment (shouldn't happen with valid table).
-    if bhi == blo:
-        return float(effective_ilo)
-
-    sub_index: float = ((ihi - effective_ilo) / (bhi - blo)) * (concentration - blo) + effective_ilo
-
-    return round(sub_index, 2)
+    # Concentration exceeds all breakpoint segments
+    return 500.0
 
 
-# ---------------------------------------------------------------------------
-# Composite AQI
-# ---------------------------------------------------------------------------
+def get_category(aqi_value: float) -> tuple[str, str]:
+    """Return the CPCB category label and health statement for an AQI value.
 
-def _lookup_category(aqi_value: float) -> tuple[str, str]:
-    """Return (category_label, health_statement) for *aqi_value*."""
-    for lo, hi, label, statement in AQI_CATEGORIES:
+    Args:
+        aqi_value: Numeric AQI value (typically 0–500).
+
+    Returns:
+        A tuple of ``(category_label, health_statement)``.
+        Falls back to ``('Severe', <severe statement>)`` for values above 500.
+    """
+    for lo, hi, label, health in AQI_CATEGORIES:
         if lo <= aqi_value <= hi:
-            return label, statement
-    # Clamp: anything above 500 treated as Severe
+            return label, health
+    # Above 500 → Severe
     return AQI_CATEGORIES[-1][2], AQI_CATEGORIES[-1][3]
 
 
@@ -237,80 +218,79 @@ def compute_aqi(
     readings: dict[str, Optional[float]],
     include_lead: bool = False,
 ) -> AQIResult:
-    """Compute the composite AQI from a set of pollutant readings.
+    """Compute the overall AQI from a set of pollutant concentration readings.
 
-    Parameters
-    ----------
-    readings     : Mapping of pollutant key → concentration (None = missing).
-    include_lead : If True, lead (pb) participates in the composite AQI.
-                   Set True only for historical analysis queries.
+    Implements the CPCB methodology:
 
-    Returns
-    -------
-    AQIResult with is_valid=True when data are sufficient, else is_valid=False
-    with a human-readable reason string.
+    * At least **3 valid pollutant** readings are required.
+    * At least one of ``pm10`` or ``pm25`` must be present.
+    * Lead (``pb``) is **excluded by default** (set ``include_lead=True``
+      to include it).
+    * The overall AQI is the **maximum** sub-index across all pollutants
+      (never mean or sum).
+    * The pollutant with the highest sub-index becomes the
+      ``responsible_pollutant``.
 
-    Validation rules (both must be satisfied for is_valid=True)
-    -----------------------------------------------------------
-    1. At least 3 non-None pollutant readings.
-    2. At least one of pm10 or pm25 must be present.
+    Args:
+        readings: Mapping of pollutant name → concentration value.
+            ``None`` values are skipped.
+        include_lead: If ``False`` (default), the ``pb`` key is excluded
+            from computation even if present.
 
-    Aggregation
-    -----------
-    AQI = max(sub_indices.values())   ← NEVER mean() or sum()
-    The pollutant with the highest sub-index is the responsible_pollutant.
+    Returns:
+        An :class:`AQIResult` instance. Check ``is_valid`` to determine
+        whether the result is usable.
     """
-    # --- filter out pb unless explicitly requested -------------------------
-    candidate_readings: dict[str, float] = {
-        key: val
-        for key, val in readings.items()
-        if val is not None
-        and (key != "pb" or include_lead)
-    }
+    # Filter out None values and optionally exclude lead
+    valid_readings: dict[str, float] = {}
+    for pollutant, value in readings.items():
+        if value is None:
+            continue
+        if pollutant == "pb" and not include_lead:
+            continue
+        if pollutant not in BREAKPOINTS:
+            continue
+        valid_readings[pollutant] = value
 
-    # --- validation rule 1: at least 3 pollutants -------------------------
-    has_pm = "pm10" in candidate_readings or "pm25" in candidate_readings
-
-    if len(candidate_readings) < 3 or not has_pm:
-        reason = (
-            "insufficient_data: need >=3 pollutants including pm10 or pm25"
-        )
+    # Validation: need at least one PM metric
+    has_pm = "pm10" in valid_readings or "pm25" in valid_readings
+    if not has_pm:
         return AQIResult(
-            aqi=None,
-            category=None,
-            responsible_pollutant=None,
             is_valid=False,
-            reason=reason,
+            reason="At least one of pm10 or pm25 must be provided for valid AQI computation",
         )
 
-    # --- compute sub-indices ----------------------------------------------
+    # Validation: need at least 3 pollutants
+    if len(valid_readings) < 3:
+        return AQIResult(
+            is_valid=False,
+            reason=(
+                f"Insufficient pollutant data: got {len(valid_readings)}, "
+                f"need at least 3 (including pm10 or pm25)"
+            ),
+        )
+
+    # Calculate sub-indices
     sub_indices: dict[str, float] = {}
-    for key, val in candidate_readings.items():
-        si = calculate_sub_index(key, val)
+    for pollutant, concentration in valid_readings.items():
+        si = calculate_sub_index(pollutant, concentration)
         if si is not None:
-            sub_indices[key] = si
+            sub_indices[pollutant] = si
 
-    # After computing, re-check we still have >=3 valid sub-indices
-    valid_pm = any(k in sub_indices for k in ("pm10", "pm25"))
-    if len(sub_indices) < 3 or not valid_pm:
+    if not sub_indices:
         return AQIResult(
-            aqi=None,
-            category=None,
-            responsible_pollutant=None,
-            sub_indices=sub_indices,
             is_valid=False,
-            reason="insufficient_data: need >=3 pollutants including pm10 or pm25",
+            reason="No valid sub-indices could be computed from the provided readings",
         )
 
-    # --- aggregation: max -------------------------------------------------
-    responsible_pollutant: str = max(sub_indices, key=lambda k: sub_indices[k])
-    aqi_value: float = sub_indices[responsible_pollutant]
+    # AQI = max across all sub-indices (CPCB rule — NEVER mean or sum)
+    responsible_pollutant = max(sub_indices, key=lambda k: sub_indices[k])
+    aqi_value = sub_indices[responsible_pollutant]
 
-    # --- category lookup --------------------------------------------------
-    category, health_statement = _lookup_category(aqi_value)
+    category, health_statement = get_category(aqi_value)
 
     return AQIResult(
-        aqi=aqi_value,
+        aqi=round(aqi_value, 2),
         category=category,
         responsible_pollutant=responsible_pollutant,
         sub_indices=sub_indices,
