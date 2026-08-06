@@ -12,4 +12,3 @@ build/
 .ruff_cache/
 *.log
 
-HAQI/
